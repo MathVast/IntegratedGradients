@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Get Integrated Gradients attribution</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <h1>Get Integrated Gradients attribution</h1>
+    <form method="post" action="/predict">
+        <label for="query">Query:</label>
+        <input type="text" id="query" name="query" required>
+        <br>
+        <label for="passage">Passage:</label>
+        <input type="text" id="passage" name="passage" required>
+        <br>
+        <button type="submit">Compute attribution</button>
+    </form>
+    <div id="loading-indicator"></div>
+    {% if attribution %}
+        <div id="output">
+            <p>{{ attribution | safe }}</p>
+        </div>
+    {% endif %}
+</body>
+</html>
