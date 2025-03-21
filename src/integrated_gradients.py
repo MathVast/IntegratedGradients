@@ -1,8 +1,6 @@
 import numpy as np
 from tqdm import tqdm
 
-import torch.nn.functional as F
-
 from utils import (
     generate_baseline_with_padded_query_and_passage_but_special_tokens,
     generate_baseline_with_padded_query_but_special_tokens,
@@ -13,12 +11,8 @@ from utils import (
 )
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-import logging
-
-logging.basicConfig(level=logging.INFO)
-
 
 def integrated_gradients(
         model,
@@ -113,7 +107,6 @@ def predict(query, passage, num_reps, batch_size):
     input_embeds = embeddings(inputs["input_ids"])
 
     # Baseline gradient
-    logging.info("### Baseline ###")
     baseline_inputs = inputs.copy()
     baseline_embeds = generate_baseline_with_padded_query_and_passage_but_special_tokens(
         tokenizer,
