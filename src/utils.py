@@ -1,14 +1,13 @@
 import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer
 from typing import Callable, Iterable, Dict, List, Optional
 import gc
+import json
 
 import logging
 
 logging.basicConfig(level=logging.INFO)
-
-import json
 
 
 def filter_module(module: str, keywords: List[str]):
@@ -122,7 +121,6 @@ class OutputsExtractor(torch.nn.Module):
         super().__init__()
         self.model = model
         self.outputs_store = dict()
-        self.previous_outputs_store = dict()
         self.hooks_handles = list()
 
         for layer_name in layer_names:
@@ -140,7 +138,6 @@ class OutputsExtractor(torch.nn.Module):
                 self.outputs_store[name].retain_grad()
             else:
                 # Else, we store the previous output and the current one
-                self.previous_outputs_store[name] = self.outputs_store[name].clone().detach().cpu()
                 self.outputs_store[name] = untuple(output) # Store it and prepares it for backprop
                 self.outputs_store[name].retain_grad()
 
@@ -158,7 +155,6 @@ class OutputsExtractor(torch.nn.Module):
                 self.outputs_store[new_name].retain_grad()
             else:
                 # Else, we store the previous output and the current one
-                self.previous_outputs_store[new_name] = self.outputs_store[new_name].clone().detach().cpu()
                 self.outputs_store[new_name] = untuple(input) # Store it and prepares it for backprop
                 self.outputs_store[new_name].retain_grad()
             
@@ -170,11 +166,9 @@ class OutputsExtractor(torch.nn.Module):
 
     def clear_items(self):
         del self.outputs_store
-        del self.previous_outputs_store
         gc.collect()
         torch.cuda.empty_cache()
         self.outputs_store = dict()
-        self.previous_outputs_store = dict()
 
     def forward(self, inputs_embeddings, token_type_ids, attention_mask):
         model_outputs = self.model(

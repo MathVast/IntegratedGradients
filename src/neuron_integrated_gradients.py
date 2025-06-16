@@ -1,11 +1,10 @@
 from typing import Dict
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import gc
-from utils import OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_and_passage_but_special_tokens, get_interesting_modules
+from utils import OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_and_passage_but_special_tokens, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules     
 
 
 def neuron_integrated_gradients(
@@ -67,21 +66,38 @@ def neuron_integrated_gradients(
        
         current_outputs = activation_fct(current_outputs.logits, dim=-1)
         all_outputs.append(current_outputs[:,pos_to_watch]) # Store all the outputs in case we need to compute the error
-        sum_output = torch.sum(current_outputs, dim=0)
-        extractor.model.zero_grad()
-        sum_output[pos_to_watch].backward()
 
-        for key, value in extractor.outputs_store.items():
-            if i == 0:
-                # We don't care about this step as the first one is the baseline
-                pass
-            else:
-                # Then, we compute the integral, which means we need to access the previous step's outputs 
-                # and the current ones, from the extractor
-                diff = (value.detach().cpu() - extractor.previous_outputs_store[key]) # Diff between the current and previous outputs
-                prod = diff * value.grad.data.detach().cpu() # Multiply this diff by the current gradient
-                # Store the product and accumulate them along the path
-                path_gradients[key] = prod if i == 1 else path_gradients[key] + prod 
+        # Now do a backward pass per input in the batch
+        for j in range(batch_pos_inputs.shape[0]):
+            extractor.model.zero_grad()
+
+            # Backward from scalar prediction
+            current_outputs[j].backward(retain_graph=True)
+
+            for key, activation in extractor.outputs_store.items():
+                grad = activation.grad.detach().cpu()
+                value = activation.detach().cpu()
+
+                if i == 0 and j == 0:
+                    # Skip baseline point, or init accumulator
+                    previous_activations = {}
+                    for k in extractor.outputs_store.keys():
+                        previous_activations[k] = extractor.outputs_store[k][0].detach().cpu()
+                    continue
+
+                # Compute contribution for this step
+                diff = value[j] - previous_activations[key]  # shape: [num_neurons]
+                prod = diff * grad[j]  # element-wise: shape [num_neurons]
+
+                if key not in path_gradients:
+                    path_gradients[key] = prod
+                else:
+                    path_gradients[key] += prod
+
+            # Save current activations as previous for next step
+            for key in previous_activations:
+                previous_activations[key] = extractor.outputs_store[key][j].detach().cpu()
+
         
     extractor.clear_items()
     extractor.remove_hooks()
@@ -94,7 +110,6 @@ def neuron_integrated_gradients(
     gc.collect()
     torch.cuda.empty_cache() 
     return path_gradients, errors if compute_error else None           
-
 
 def predict(query, passage, num_reps, batch_size):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -120,7 +135,7 @@ def predict(query, passage, num_reps, batch_size):
 
     # Baseline gradient
     baseline_inputs = inputs.copy()
-    baseline_embeds = generate_baseline_with_padded_query_and_passage_but_special_tokens(
+    baseline_embeds = generate_baseline_with_padded_query_but_special_tokens(
         tokenizer,
         baseline_inputs["input_ids"],
         embeddings,
@@ -144,5 +159,6 @@ if __name__ == '__main__':
     query = "what was the immediate impact of the success of the manhattan project?"  # "what do the xylem and the phloem do"
     passage = "The Manhattan Project and its atomic bomb helped bring an end to World War II. Its legacy of peaceful uses of atomic energy continues to have an impact on history and science."
 
-    nig, error = predict(query, passage, 20, 10)
+    nig, error = predict(query, passage, 200, 1)
+    nig_old, _ = predict_old(query, passage, 200, 1)
     print(nig.keys())
