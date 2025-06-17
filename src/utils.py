@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from transformers import AutoTokenizer
-from typing import Callable, Iterable, Dict, List, Optional
+from typing import Callable, Iterable, Dict, List, Optional, Tuple
 import gc
 import json
 
@@ -19,7 +19,7 @@ def get_interesting_modules(model, list_regex: Optional[List[str]] = None) -> Di
 
     :return Dict: Dictionnary where the key is the module's name and the value is the number of out features.
     """
-    interesting_layers = ["self.query", "self.value", "self.key", "self.dropout", "intermediate.dense", "output.dense"]
+    interesting_layers = ["self.dropout", "intermediate.dense"]
     neurons_per_layers = dict() 
     total_nb_of_neurons = 0
     for name, module in model.named_modules():
@@ -44,7 +44,20 @@ def get_interesting_modules(model, list_regex: Optional[List[str]] = None) -> Di
 
     return neurons_per_layers, total_nb_of_neurons
 
+def get_token_types_spans(input, tokenizer) -> List[Tuple]:
+    """Returns a list of spans corresponding to the positions in the input
+    of respectively, the CLS token, the query's tokens, the document's tokens and the SEP tokens.
 
+    """
+    slices = [slice(0,1)] # Initiate the spans with the position of the CLS token
+    input_splitted = split_list_by_values(np.array(input[0].cpu()), [tokenizer.sep_token_id])
+    query_len = len(input_splitted[0]) - 2 # -1 to account for the CLS token and the first SEP token
+    document_len = len(input_splitted[1]) - 1 # -1 to account for the second SEP token
+    slices.append(slice(1, query_len + 1)) # The query's tokens
+    slices.append(slice(query_len + 1, query_len + 2)) # The first SEP token
+    slices.append(slice(query_len + 2, query_len + 2 + document_len)) # The document's tokens
+    slices.append(slice(query_len + 2 + document_len, query_len + 2 + document_len + 1)) # The second SEP token
+    return slices
 
 class NumpyArrayEncoder(json.JSONEncoder):
     # Special class used to encode numpy array into json files

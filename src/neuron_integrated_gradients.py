@@ -1,10 +1,12 @@
+import itertools
 from typing import Dict
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import gc
-from utils import OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_and_passage_but_special_tokens, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules     
+from utils import OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_and_passage_but_special_tokens, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules, get_token_types_spans     
 
 
 def neuron_integrated_gradients(
@@ -109,9 +111,35 @@ def neuron_integrated_gradients(
             
     gc.collect()
     torch.cuda.empty_cache() 
-    return path_gradients, errors if compute_error else None           
+    return path_gradients, errors if compute_error else None      
 
-def predict(query, passage, num_reps, batch_size):
+def aggregate_nig(nig, spans, aggregate_per_token_type=False):
+    """
+    Aggregate the neuron integrated gradients (NIG) across token types if specified.
+    """
+    input_part_to_position = {"cls": 0, "query": 1, "sep_1": 2, "document": 3, "sep_2": 4}
+    storage = dict()
+    
+    for key, value in nig.items():
+        if aggregate_per_token_type:
+            storage[key] = dict()
+            if "attention_probs" in key:
+                for couple in itertools.product(input_part_to_position.keys(), repeat=2):
+                    # itertools.product is equivalent to a nest for loop and creates every possible combinations of the input_parts (total nb is 25).
+                    # For each couple of input parts, we select the corresponding slices in the last two dimensions and sum over these dimensions.
+                    # To mitigate the impact of the input length, we then average it by the product of the lengths of the two slices.
+                    storage[key][f"{couple[0]}_{couple[1]}"] = torch.sum(value[:,spans[input_part_to_position[couple[0]]],spans[input_part_to_position[couple[1]]]], axis=(1,2), keepdim=True)
+            else:
+                for input_part, idx in input_part_to_position.items():
+                    storage[key][input_part] = torch.sum(value[spans[idx],:], axis=0)
+        else:
+            storage[key] = value
+
+    print(f"Results have been aggregated.")
+
+    return storage
+
+def predict(query, passage, num_reps, batch_size, aggregate_per_token_type=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L12-v2").to(device)
     model.eval()
@@ -129,6 +157,8 @@ def predict(query, passage, num_reps, batch_size):
         return_attention_mask=True,
         return_tensors="pt"
     ).to(model.device)
+
+    spans = get_token_types_spans(inputs["input_ids"], tokenizer)
 
     embeddings = model.bert.get_input_embeddings()
     input_embeds = embeddings(inputs["input_ids"])
@@ -153,12 +183,16 @@ def predict(query, passage, num_reps, batch_size):
         num_labels=num_labels,
     )
 
+    nig = aggregate_nig(
+        nig,
+        spans=spans,
+        aggregate_per_token_type=aggregate_per_token_type,
+    )
+
     return nig, error
 
 if __name__ == '__main__':
     query = "what was the immediate impact of the success of the manhattan project?"  # "what do the xylem and the phloem do"
     passage = "The Manhattan Project and its atomic bomb helped bring an end to World War II. Its legacy of peaceful uses of atomic energy continues to have an impact on history and science."
 
-    nig, error = predict(query, passage, 200, 1)
-    nig_old, _ = predict_old(query, passage, 200, 1)
-    print(nig.keys())
+    nig, error = predict(query, passage, 200, 1, aggregate_per_token_type=True)
