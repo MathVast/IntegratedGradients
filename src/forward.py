@@ -1,8 +1,5 @@
-from typing import Dict
-import numpy as np
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer       
 
 if __name__ == '__main__':
@@ -30,5 +27,13 @@ if __name__ == '__main__':
     outputs = model(**inputs)
     
     print(f"** Default model output: {outputs} **")
-    print(f"** From logits to proba: {torch.sigmoid(outputs.logits)} **")
-    print(f"** From proba to label: {1 if torch.sigmoid(outputs.logits) >= 0.5 else 0} **")
+    if model.config.num_labels == 1:
+        pos_to_watch = 0
+        activation_fct = F.sigmoid
+    else: # Always watch for the positive class
+        pos_to_watch = 1
+        activation_fct = F.softmax
+    score = activation_fct(outputs.logits)[0][pos_to_watch]
+    print(f"** From logits to proba: {score} **")
+
+    print(f"** From proba to label: {1 if score >= 0.5 else 0} **")
