@@ -133,7 +133,10 @@ def aggregate_nig(nig, spans, aggregate_per_token_type=False):
                 for input_part, idx in input_part_to_position.items():
                     storage[key][input_part] = torch.sum(value[spans[idx],:], axis=0)
         else:
-            storage[key] = value
+            if "attention_probs" in key:
+                storage[key] = {'all': torch.sum(value, axis=(1,2))}
+            else:
+                storage[key] = {'all': torch.sum(value, axis=0)}
 
     print(f"Results have been aggregated.")
 
@@ -195,4 +198,4 @@ if __name__ == '__main__':
     query = "what was the immediate impact of the success of the manhattan project?"  # "what do the xylem and the phloem do"
     passage = "The Manhattan Project and its atomic bomb helped bring an end to World War II. Its legacy of peaceful uses of atomic energy continues to have an impact on history and science."
 
-    nig, error = predict(query, passage, 200, 1, aggregate_per_token_type=True)
+    nig, error = predict(query, passage, 200, 1, aggregate_per_token_type=False)

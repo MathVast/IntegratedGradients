@@ -1,7 +1,7 @@
 import torch
 import pickle
 from pathlib import Path
-from src.neuron_integrated_gradients import predict
+from neuron_integrated_gradients import predict
 
 def get_masks(nig_model, percentage_attention: float, percentage_ffn: float, aggregate_per_token_type: bool = True):
     attention_probs_keys = [key for key in nig_model.keys() if "attention_probs" in key]
@@ -43,6 +43,7 @@ def get_masks(nig_model, percentage_attention: float, percentage_ffn: float, agg
                     top_neurons_per_layer_model[key][input_part] = 1
                 else:
                     top_neurons_per_layer_model[key][input_part] = 0
+
             else:
                 indices = (value > ffn_threshold_value).nonzero().squeeze()
                 if len(indices.size()) == 0:
@@ -50,14 +51,16 @@ def get_masks(nig_model, percentage_attention: float, percentage_ffn: float, agg
                 else:
                     top_neurons_per_layer_model[key][input_part] = indices
 
+    return top_neurons_per_layer_model
+
     
 
 if __name__ == '__main__':
     query = "what was the immediate impact of the success of the manhattan project?"  # "what do the xylem and the phloem do"
     passage = "The Manhattan Project and its atomic bomb helped bring an end to World War II. Its legacy of peaceful uses of atomic energy continues to have an impact on history and science."
 
-    nig, error = predict(query, passage, 20, 10)
+    nig, error = predict(query, passage, 20, 10, aggregate_per_token_type=True)
     print(nig.keys())
 
-    top_neurons = get_masks(nig, 0.01, 0.01, aggregate_per_token_type=False)
+    top_neurons = get_masks(nig, 0.01, 0.01)
     print(top_neurons)
