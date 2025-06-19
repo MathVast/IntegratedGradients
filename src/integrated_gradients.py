@@ -37,10 +37,10 @@ def integrated_gradients(
     """
     if num_labels == 1:
         pos_to_watch = 0
-        activation_fct = lambda x, dim: x
+        activation_fct = lambda x, dim: F.sigmoid(x)
     else: # Always watch for the positive class
         pos_to_watch = 1
-        activation_fct = F.softmax
+        activation_fct = lambda x, dim: F.softmax(x, dim=dim)
 
     list_scaled_embeddings = _get_scaled_inputs(
         input_embeddings[0].cpu().detach().numpy(),

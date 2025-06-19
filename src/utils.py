@@ -59,6 +59,12 @@ def get_token_types_spans(input, tokenizer) -> List[Tuple]:
     slices.append(slice(query_len + 2 + document_len, query_len + 2 + document_len + 1)) # The second SEP token
     return slices
 
+def parse_layer_head(name):
+    parts = name.split('.')
+    layer_num = int(parts[3])  # 'layer.0' → index 3
+    head_num = int(parts[-1])  # 'attention_probs.0' → last index
+    return layer_num, head_num
+
 class NumpyArrayEncoder(json.JSONEncoder):
     # Special class used to encode numpy array into json files
     def default(self, obj):
@@ -76,60 +82,8 @@ def untuple(x):
     return x[0] if isinstance(x, tuple) else x
 
 
-class InputsExtractor(torch.nn.Module):
-    # Hook used to extract inputs from a list of modules during a forward pass
-    def __init__(self, model: torch.nn.Module, token_type_ids: Iterable[torch.Tensor],
-                 attention_mask: Iterable[torch.Tensor], layer_names: Iterable[str]):
-        super().__init__()
-        self.model = model
-        self.token_type_ids = token_type_ids
-        self.attention_mask = attention_mask
-        self.inputs = dict()
-        self.inputs_store = dict()
-        self.hooks_handles = list()
-
-        for layer_name in layer_names:
-            layer = dict([*self.model.named_modules()])[layer_name]
-            self.hooks_handles.append(layer.register_forward_hook(self.save_inputs_hooks(layer_name)))
-
-    @property
-    def items(self):
-        return self.inputs
-
-    @property
-    def items_store(self):
-        return self.inputs_store
-
-    def save_inputs_hooks(self, name) -> Callable:
-        def hook(_, input, __):
-            self.inputs[name] = input[0]  # Store it and prepares it for backprop
-            self.inputs[name].retain_grad()
-
-            if name in self.inputs_store.keys():
-                self.inputs_store[name].append(input[0])
-            else:
-                self.inputs_store[name] = [input[0]]
-
-        return hook
-
-    def remove_hooks(self):
-        for handle in self.hooks_handles:
-            handle.remove()
-
-    def clear_items(self):
-        del self.inputs
-        gc.collect()
-        torch.cuda.empty_cache()
-        self.inputs = dict()
-
-    def forward(self, inputs_embeddings):
-        model_outputs = self.model(inputs_embeds=inputs_embeddings, token_type_ids=self.token_type_ids,
-                                   attention_mask=self.attention_mask)
-        return model_outputs
-
-
 class OutputsExtractor(torch.nn.Module):
-    # SAme as InputsExtractor but to extract outputs instead
+    # Hook to extract the outputs of some modules
     def __init__(self, model: torch.nn.Module, layer_names: Iterable[str]):
         super().__init__()
         self.model = model

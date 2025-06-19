@@ -1,9 +1,7 @@
 import torch
-import pickle
-from pathlib import Path
 from neuron_integrated_gradients import predict
 
-def get_masks(nig_model, percentage_attention: float, percentage_ffn: float, aggregate_per_token_type: bool = True):
+def get_masks(nig_model, percentage_attention: float, percentage_ffn: float):
     attention_probs_keys = [key for key in nig_model.keys() if "attention_probs" in key]
 
     for key in attention_probs_keys:
