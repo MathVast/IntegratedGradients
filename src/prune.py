@@ -1,7 +1,7 @@
 import torch
 from neuron_integrated_gradients import predict
 
-def get_masks(nig_model, percentage_attention: float, percentage_ffn: float):
+def get_masks(nig_model, pruning_percentage_attention: float, pruning_percentage_ffn: float):
     attention_probs_keys = [key for key in nig_model.keys() if "attention_probs" in key]
 
     for key in attention_probs_keys:
@@ -28,8 +28,14 @@ def get_masks(nig_model, percentage_attention: float, percentage_ffn: float):
     attention_all_sums_along_input = torch.sort(attention_all_sums_along_input).values
     ffn_all_sums_along_input = torch.cat(ffn_all_sums_along_input, dim=0)
     ffn_all_sums_along_input = torch.sort(ffn_all_sums_along_input).values
-    attention_threshold_value = attention_all_sums_along_input[int((1 - percentage_attention) * len(attention_all_sums_along_input))]
-    ffn_threshold_value = ffn_all_sums_along_input[int((1 - percentage_ffn) * len(ffn_all_sums_along_input))]
+    if pruning_percentage_attention > 0:
+        attention_threshold_value = attention_all_sums_along_input[int((1 - pruning_percentage_attention) * len(attention_all_sums_along_input))]
+    else:
+        attention_threshold_value = attention_all_sums_along_input[-1] # If no pruning, set threshold to 0
+    if pruning_percentage_ffn > 0:
+        ffn_threshold_value = ffn_all_sums_along_input[int((1 - pruning_percentage_ffn) * len(ffn_all_sums_along_input))]
+    else: 
+        ffn_threshold_value = ffn_all_sums_along_input[-1] # If no pruning, set threshold to 0
     
     # Apply them to get the masks
     top_neurons_per_layer_model = dict()
@@ -60,5 +66,5 @@ if __name__ == '__main__':
     nig, error = predict(query, passage, 20, 10, aggregate_per_token_type=True)
     print(nig.keys())
 
-    top_neurons = get_masks(nig, 0.01, 0.01)
+    top_neurons = get_masks(nig, pruning_percentage_attention=0.01, pruning_percentage_ffn=0.01)
     print(top_neurons)
