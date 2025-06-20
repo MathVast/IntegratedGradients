@@ -9,6 +9,7 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 
+INPUT_PART_TO_POSITION = {"cls": 0, "query": 1, "sep_1": 2, "document": 3, "sep_2": 4}
 
 def filter_module(module: str, keywords: List[str]):
     return any(word in module for word in keywords)
