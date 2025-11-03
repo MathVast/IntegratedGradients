@@ -1,84 +1,54 @@
 import itertools
-from typing import Callable, Dict, Iterable
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForSequenceClassification, AutoTokenizer       
 
-from neuron_integrated_gradients import predict
+from neuron_integrated_gradients import aggregate_nig, predict, neuron_integrated_gradients
 from prune import get_masks
-from utils import get_token_types_spans, INPUT_PART_TO_POSITION, untuple
+from pruned_forward import PrunedModel, pruned_forward
+from utils import generate_baseline_with_padded_query_but_special_tokens, get_token_types_spans, INPUT_PART_TO_POSITION
 
-class PrunedModel(torch.nn.Module):
-    # Hook used to mask the output of some layer given a pruning scheme
-    def __init__(self, model: torch.nn.Module, positions_per_module: Dict, device):
-        super().__init__()
-        self.model = model
-        self.device = device
-        self.hooks_handles = list()
-
-        for layer_name, layer in positions_per_module.items():
-            if "attention_probs" in layer_name:
-                num_head = int(layer_name.split(".")[-1])
-                dropout_module_name = layer_name.replace(f"attention_probs.{num_head}", "dropout")
-                layer = dict([*self.model.named_modules()])[dropout_module_name]
-                self.hooks_handles.append(layer.register_forward_hook(self.prune_dropout(self.device, positions_per_module[layer_name], num_head)))
-            else:
-                layer = dict([*self.model.named_modules()])[layer_name]
-
-                self.hooks_handles.append(layer.register_forward_hook(self.prune_outputs_hook(self.device, positions_per_module[layer_name])))
-
-    @property
-    def config(self):
-        return self.model.config
-
-    def prune_outputs_hook(self, device, positions: Iterable) -> Callable:
-        def hook(model, input, output):
-            output = untuple(output)
-            mask = torch.ones(output[0].numel())
-            for idx in positions:
-                mask[int(idx)] = 0
-            mask = mask.to(device)
-            masked_output = list()
-            for elmt in output:
-                flattened_elmt = elmt.flatten()
-                masked_elmt = mask * flattened_elmt
-                masked_elmt = masked_elmt.view(elmt.shape)
-                masked_output.append(masked_elmt)
-            masked_output = torch.stack(masked_output, dim=0)
-            return masked_output
-        return hook
-    
-    def prune_dropout(self, device, head_mask: Iterable, num_head: int) -> Callable:
-        def hook(model, input, output):
-            output = untuple(output)
-            mask = head_mask.to(device)
-            masked_output = output.clone()
-            masked_output[:, num_head, :, :] *= mask
-            return masked_output
-        return hook
-
-    def forward(self, token_type_ids, attention_mask, input_ids=None, inputs_embeds=None):
-        if input_ids is not None:
-            model_outputs = self.model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
-        else:
-            model_outputs = self.model(inputs_embeds=inputs_embeds, token_type_ids=token_type_ids, attention_mask=attention_mask)
-        return model_outputs
-    
-    def remove_hooks(self):
-        for handle in self.hooks_handles:
-            handle.remove()
-
-
-def pruned_forward(model, tokenizer, inputs, neurons_to_prune, input_length: int = 128):
+def pruned_predict(query, passage, num_reps, batch_size, neurons_to_prune, aggregate_per_token_type=False, max_input_length=128):
     """
     Forward pass by cutting the top neurons out of the model.
     """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L12-v2").to(device)
+    model.eval()
+
+    num_labels = model.config.num_labels
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    inputs = tokenizer(
+        query,
+        passage,
+        max_length=max_input_length,
+        truncation=True,
+        padding="max_length",
+        return_attention_mask=True,
+        return_tensors="pt"
+    ).to(model.device)
+
+    spans = get_token_types_spans(inputs["input_ids"], tokenizer)
+
+    embeddings = model.bert.get_input_embeddings()
+    input_embeds = embeddings(inputs["input_ids"])
+
+    # Baseline gradient
+    baseline_inputs = inputs.copy()
+    baseline_embeds = generate_baseline_with_padded_query_but_special_tokens(
+        tokenizer,
+        baseline_inputs["input_ids"],
+        embeddings,
+        device
+    )
 
     ### This block should probably be factorized if multiple forwards need to be called ###
     neurons_to_dimensions = dict()
     for key, value_per_input_part in neurons_to_prune.items():
         if "attention_probs" in key:
-            neurons_to_dimensions[key] = torch.ones((input_length, input_length), device=model.device)
+            neurons_to_dimensions[key] = torch.ones((max_input_length, max_input_length), device=model.device)
             value = value_per_input_part.get("all", None)
             if value is not None:
                 neurons_to_dimensions[key] *= (1-value)
@@ -97,7 +67,7 @@ def pruned_forward(model, tokenizer, inputs, neurons_to_prune, input_length: int
                         new_list = list()
                         out_features = model.get_submodule(key).out_features
                         for neuron_position in value:
-                            new_list += [neuron_position+i*out_features for i in range(input_length)] # Need to scale one neuron to the whole column
+                            new_list += [neuron_position+i*out_features for i in range(max_input_length)] # Need to scale one neuron to the whole column
                         neurons_to_dimensions[key] = new_list
                     else:
                         # In that case we need to prune the neurons only on the range corresponding to the input part
@@ -109,35 +79,33 @@ def pruned_forward(model, tokenizer, inputs, neurons_to_prune, input_length: int
                             new_list += [neuron_position+i*out_features for i in range(positions_to_cut.start, positions_to_cut.stop)] # Need to scale one neuron to the whole column
                         neurons_to_dimensions[key] = new_list if neurons_to_dimensions.get(key) is None else neurons_to_dimensions[key] + new_list
 
-    ## End of the block that should be factorized ###
-
     pruned_model = PrunedModel(
         model=model,
         positions_per_module=neurons_to_dimensions,
         device=model.device
     )
 
-    if model.config.num_labels == 1:
-        pos_to_watch = 0
-        activation_fct = lambda x, dim: F.sigmoid(x)
-    else: # Always watch for the positive class
-        pos_to_watch = 1
-        activation_fct = lambda x, dim: F.softmax(x, dim=dim)
+    nig, error = neuron_integrated_gradients(
+        model=pruned_model,
+        input_embeddings=input_embeds,
+        token_type_ids=inputs["token_type_ids"],
+        attention_mask=inputs["attention_mask"],
+        baseline_embeddings=baseline_embeds,
+        num_reps=num_reps,
+        batch_size=batch_size,
+        num_labels=num_labels,
+    )
 
-    with torch.no_grad():
-        pruned_pred = activation_fct(
-            pruned_model(
-                **inputs
-            ).logits,
-            dim=-1
-        ).cpu()
+    nig = aggregate_nig(
+        nig,
+        spans=spans,
+        aggregate_per_token_type=aggregate_per_token_type,
+    )
 
-    pruned_model.remove_hooks()
-
-    return pruned_pred[0][pos_to_watch].item()
+    return nig, error
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     query = "what was the immediate impact of the success of the manhattan project?"  # "what do the xylem and the phloem do"
     passage = "The Manhattan Project and its atomic bomb helped bring an end to World War II. Its legacy of peaceful uses of atomic energy continues to have an impact on history and science."
     # passage = "Phloem and xylem are complex tissues that perform transportation of food and water in a plant."
@@ -174,7 +142,7 @@ if __name__ == '__main__':
     print(f"** From proba to label: {1 if score >= 0.5 else 0} **")
 
     print("Running neuron integrated gradients...")
-    nig, error = predict(query, passage, 10, 10, aggregate_per_token_type=True)
+    nig, error = predict(query, passage, 10, 10, aggregate_per_token_type=True, max_input_length=max_input_length)
 
     print("Generating the masks...")
     top_neurons = get_masks(nig, 0.0, 1.0)
@@ -190,3 +158,16 @@ if __name__ == '__main__':
 
     print(f"** Pruned model output: {pruned_score} **")
     print(f"** Pruned label: {1 if pruned_score >= 0.5 else 0} **")
+
+    print("Running neuron integrated gradients on the pruned model...")
+    new_nig, error = pruned_predict(
+        query, 
+        passage, 
+        num_reps=10, 
+        batch_size=10, 
+        neurons_to_prune=top_neurons, 
+        aggregate_per_token_type=True, 
+        max_input_length=max_input_length
+    )
+     
+    new_top_neurons = get_masks(new_nig, 0.0, 1.0)

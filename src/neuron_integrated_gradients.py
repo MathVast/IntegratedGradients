@@ -142,7 +142,7 @@ def aggregate_nig(nig, spans, aggregate_per_token_type=False):
 
     return storage
 
-def predict(query, passage, num_reps, batch_size, aggregate_per_token_type=False):
+def predict(query, passage, num_reps, batch_size, aggregate_per_token_type=False, max_input_length=128):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L12-v2").to(device)
     model.eval()
@@ -154,9 +154,9 @@ def predict(query, passage, num_reps, batch_size, aggregate_per_token_type=False
     inputs = tokenizer(
         query,
         passage,
-        max_length=512,
+        max_length=max_input_length,
         truncation=True,
-        padding=True,
+        padding="max_length",
         return_attention_mask=True,
         return_tensors="pt"
     ).to(model.device)
