@@ -8,9 +8,9 @@ from prune import get_masks
 from pruned_forward import PrunedModel, pruned_forward
 from utils import generate_baseline_with_padded_query_but_special_tokens, get_token_types_spans, INPUT_PART_TO_POSITION
 
-def pruned_predict(query, passage, num_reps, batch_size, neurons_to_prune, aggregate_per_token_type=False, max_input_length=128):
+def post_pruning_nig(query, passage, num_reps, batch_size, neurons_to_prune, aggregate_per_token_type=False, max_input_length=128):
     """
-    Forward pass by cutting the top neurons out of the model.
+    Compute NIG while taking into account a pruning scheme.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L12-v2").to(device)
@@ -160,7 +160,7 @@ if __name__ == "__main__":
     print(f"** Pruned label: {1 if pruned_score >= 0.5 else 0} **")
 
     print("Running neuron integrated gradients on the pruned model...")
-    new_nig, error = pruned_predict(
+    new_nig, error = post_pruning_nig(
         query, 
         passage, 
         num_reps=10, 
