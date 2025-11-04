@@ -1,5 +1,6 @@
 import gc
 from enum import Enum
+from typing import Optional
 from pyparsing import Dict
 import torch
 import torch.nn.functional as F
@@ -7,7 +8,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from tqdm import tqdm      
 
 from neuron_integrated_gradients import aggregate_nig
-from utils import OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules, get_token_types_spans, INPUT_PART_TO_POSITION
+from utils import InputPart, OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules, get_token_types_spans, INPUT_PART_TO_POSITION
 
 class NeuronType(Enum):
     ATTENTION = "attention"
@@ -15,7 +16,7 @@ class NeuronType(Enum):
 
     def check_idx(self, model, idx: int) -> bool:
         nb_attention_heads = model.config.num_attention_heads
-        ffn_dim = model.config.hidden_size
+        ffn_dim = model.config.intermediate_size
 
         if self == NeuronType.ATTENTION:
             return nb_attention_heads > idx >= 0  # Attention heads can be indexed from 0 to num_heads - 1
@@ -37,11 +38,11 @@ def conditional_nig(
     baseline_embeddings,
     num_reps: int, 
     batch_size: int, 
-    num_labels: int,
     layer_idx: int, 
     neuron_idx: int, 
     neuron_type: NeuronType, 
-    aggregate_per_token_type=False,
+    target_input_part: Optional[InputPart] = None,
+    spans: Optional[torch.Tensor] = None,
     compute_error: bool = False,
 ) -> Dict:
     """
@@ -55,8 +56,19 @@ def conditional_nig(
     :param int num_label: Number of output labels for the model.
     :param int num_reps: Number of iteration to approximate the integrated gradients.
     :param int batch_size: Batch size used for each iteration (true number of steps is batch_size x num_reps).
+    :param int layer_idx: The layer index of the target neuron.
+    :param int neuron_idx: The index of the target neuron within the layer (between 0 and num_heads-1 for attention / between 0 and ffn_dim-1 for FFN). 
+    :param NeuronType neuron_type: The nature of the target neuron (attention or feedforward).
+    :param InputPart target_input_part: If provided, condition the value of the neruon we are interested in to a specific input part.
+    :param Tensor spans: If provided, delimitate the spans corresponding to the different input parts and is used when target_input_part is specified.
+    :param bool compute_error: Whether to compute the IG approximation error or not.
     :return Dict: Attribution for each activation unit for each layer in the model.
     """
+    if spans is None and target_input_part is not None:
+        raise ValueError("If target_input_part is specified, spans must also be provided.")
+    if spans is not None and target_input_part is None:
+        raise ValueError("If spans are provided, target_input_part must also be specified.")
+
     layer_names, _ = get_interesting_modules(
         model=model,
         list_regex=None # at this point we don't want to filter the modules for now
@@ -98,18 +110,18 @@ def conditional_nig(
         if neuron_type == NeuronType.ATTENTION:
             # For attention, we have a 4D tensor: (batch_size, num_heads, seq_len, seq_len)
             target_neuron_activation = target_activation[:, neuron_idx, :, :] # Shape (batch_size, seq_len, seq_len)
-            if not aggregate_per_token_type:
+            if not target_input_part:
                 # Aggregate over all attention positions
                 target_neuron_activation = target_neuron_activation.sum(dim=(1,2))  # Shape (batch_size)
-            else:
-                raise NotImplementedError("Aggregation per token type not implemented yet.")
+            else:        
+                target_neuron_activation = torch.sum(target_neuron_activation[:,spans[INPUT_PART_TO_POSITION[str(target_input_part)]],spans[INPUT_PART_TO_POSITION[str(target_input_part)]]], axis=(1,2), keepdim=True)                
         else:
             # For FFN, we have a 3D tensor: (batch_size, seq_len, hidden_size)
-            target_neuron_activation = target_activation[:, :, neuron_idx] # Shape (batch_size, seq_len)
-            if not aggregate_per_token_type:
-                target_neuron_activation = target_neuron_activation.sum(dim=(1))  # Shape (batch_size)
+            target_neuron_activation = target_activation[:, :, neuron_idx] 
+            if not target_input_part:
+                target_neuron_activation = target_neuron_activation.sum(dim=(1))
             else:
-                raise NotImplementedError("Aggregation per token type not implemented yet.")
+                target_neuron_activation = torch.sum(target_neuron_activation[:,spans[INPUT_PART_TO_POSITION[str(target_input_part)]]], axis=(1), keepdim=True) 
 
         # Now do a backward pass per input in the batch
         for j in range(batch_pos_inputs.shape[0]):
@@ -162,6 +174,7 @@ def compute_conditional_nig(
         layer_idx: int, 
         neuron_idx: int, 
         neuron_type: NeuronType, 
+        target_input_part: Optional[InputPart] = None,
         aggregate_per_token_type=False, 
         max_input_length=128
     ):
@@ -175,6 +188,7 @@ def compute_conditional_nig(
     :param int layer_idx: Layer index of the target neuron.
     :param int neuron_idx: Neuron index within the target layer.
     :param NeuronType neuron_type: Type of the neuron (e.g., attention, feedforward).
+    :param InputPart target_input_part: If provided, condition the value of the neuron we are interested in to a specific input part.
     :param bool aggregate_per_token_type: Whether to aggregate the NIG per input part or not.
     :param int max_input_length: Maximum input length for the model.
     """
@@ -187,8 +201,6 @@ def compute_conditional_nig(
     
     if layer_idx >= model.config.num_hidden_layers:
         raise ValueError(f"Invalid target layer index {layer_idx}. Model has {model.config.num_hidden_layers} layers.")
-
-    num_labels = model.config.num_labels
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
@@ -225,11 +237,11 @@ def compute_conditional_nig(
         baseline_embeddings=baseline_embeds,
         num_reps=num_reps,
         batch_size=batch_size,
-        num_labels=num_labels,
         layer_idx=layer_idx,
         neuron_idx=neuron_idx,
         neuron_type=neuron_type,
-        aggregate_per_token_type=aggregate_per_token_type,
+        target_input_part=target_input_part,
+        spans=spans if target_input_part is not None else None,
     )
 
     nig = aggregate_nig(
@@ -283,9 +295,10 @@ if __name__ == "__main__":
         passage, 
         10, 
         10, 
-        aggregate_per_token_type=False, 
+        aggregate_per_token_type=True, 
         max_input_length=max_input_length, 
         layer_idx=5, 
-        neuron_idx=3, 
-        neuron_type=NeuronType.FFN
+        neuron_idx=1200, 
+        neuron_type=NeuronType.FFN,
+        target_input_part=InputPart.DOCUMENT
     )
