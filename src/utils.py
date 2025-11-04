@@ -1,3 +1,4 @@
+from enum import Enum
 import torch
 import numpy as np
 from transformers import AutoTokenizer
@@ -10,6 +11,16 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 INPUT_PART_TO_POSITION = {"cls": 0, "query": 1, "sep_1": 2, "document": 3, "sep_2": 4}
+
+class InputPart(Enum):
+    CLS = "cls"
+    QUERY = "query"
+    SEP_1 = "sep_1"
+    DOCUMENT = "document"
+    SEP_2 = "sep_2"
+
+    def __str__(self):
+        return self.value
 
 def filter_module(module: str, keywords: List[str]):
     return any(word in module for word in keywords)

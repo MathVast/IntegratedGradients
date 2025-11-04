@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import gc
-from utils import OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_and_passage_but_special_tokens, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules, get_token_types_spans     
+from utils import INPUT_PART_TO_POSITION, OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_and_passage_but_special_tokens, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules, get_token_types_spans     
 
 
 def neuron_integrated_gradients(
@@ -117,20 +117,19 @@ def aggregate_nig(nig, spans, aggregate_per_token_type=False):
     """
     Aggregate the neuron integrated gradients (NIG) across token types if specified.
     """
-    input_part_to_position = {"cls": 0, "query": 1, "sep_1": 2, "document": 3, "sep_2": 4}
     storage = dict()
     
     for key, value in nig.items():
         if aggregate_per_token_type:
             storage[key] = dict()
             if "attention_probs" in key:
-                for couple in itertools.product(input_part_to_position.keys(), repeat=2):
+                for couple in itertools.product(INPUT_PART_TO_POSITION.keys(), repeat=2):
                     # itertools.product is equivalent to a nest for loop and creates every possible combinations of the input_parts (total nb is 25).
                     # For each couple of input parts, we select the corresponding slices in the last two dimensions and sum over these dimensions.
                     # To mitigate the impact of the input length, we then average it by the product of the lengths of the two slices.
-                    storage[key][f"{couple[0]}_{couple[1]}"] = torch.sum(value[:,spans[input_part_to_position[couple[0]]],spans[input_part_to_position[couple[1]]]], axis=(1,2), keepdim=True)
+                    storage[key][f"{couple[0]}_{couple[1]}"] = torch.sum(value[:,spans[INPUT_PART_TO_POSITION[couple[0]]],spans[INPUT_PART_TO_POSITION[couple[1]]]], axis=(1,2), keepdim=True)
             else:
-                for input_part, idx in input_part_to_position.items():
+                for input_part, idx in INPUT_PART_TO_POSITION.items():
                     storage[key][input_part] = torch.sum(value[spans[idx],:], axis=0)
         else:
             if "attention_probs" in key:
