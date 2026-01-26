@@ -42,7 +42,16 @@ def get_layer_idx_from_module_name(module_name: str) -> int:
     except (ValueError, IndexError):
         raise ValueError(f"Invalid module name format: {module_name}")
 
-def aggregate_conditional_nig(nig, spans, layer_idx: int, neuron_idx: int, aggregate_per_token_type=False, source_input_part: Optional[InputPart] = None, target_input_part: Optional[InputPart] = None):
+def aggregate_conditional_nig(
+        nig, 
+        spans, 
+        layer_idx: int, 
+        neuron_idx: int, 
+        neuron_type: NeuronType,
+        aggregate_per_token_type=False, 
+        source_input_part: Optional[InputPart] = None, 
+        target_input_part: Optional[InputPart] = None
+):
     """
     Aggregate the neuron integrated gradients (NIG) across token types if specified.
     For conditional NIG, this function also acts as a selector of the active slices and if filters out all the other
@@ -53,9 +62,9 @@ def aggregate_conditional_nig(nig, spans, layer_idx: int, neuron_idx: int, aggre
     for key, value in nig.items():
         if aggregate_per_token_type:
             storage[key] = dict()
+            layer_idx_in_key = get_layer_idx_from_module_name(key)
             if "attention_probs" in key:
-                layer_idx_in_key = get_layer_idx_from_module_name(key)
-                if layer_idx_in_key == layer_idx:
+                if layer_idx_in_key == layer_idx and neuron_type == NeuronType.ATTENTION:
                     # If target layer of the conditonal NIG, we apply the filtering
                     if source_input_part is not None and target_input_part is not None:
                         # If both inpupt parts are specified, we only keep the corresponding slice
@@ -99,7 +108,21 @@ def aggregate_conditional_nig(nig, spans, layer_idx: int, neuron_idx: int, aggre
                         
             else:
                 for input_part, idx in INPUT_PART_TO_POSITION.items():
-                    storage[key][input_part] = torch.sum(value[spans[idx],:], axis=0)
+                    if target_input_part is not None and neuron_type == NeuronType.FFN and layer_idx_in_key == layer_idx:
+                        if input_part == str(target_input_part):
+                            storage[key][input_part] = torch.sum(value[spans[idx],:], axis=0)
+
+                        if neuron_idx is not None:
+                            # Set to NaN all other positions except the one corresponding to the neuron_idx
+                            for k in storage[key].keys():
+                                temp = storage[key][k]
+                                mask = torch.ones_like(temp, dtype=bool)
+                                mask[neuron_idx] = False
+                                temp = temp.masked_fill(mask, float('nan'))
+                                storage[key][k] = temp
+
+                    else:
+                        storage[key][input_part] = torch.sum(value[spans[idx],:], axis=0)
         else:
             if "attention_probs" in key:
                 storage[key] = {'all': torch.sum(value, axis=(1,2))}
@@ -334,6 +357,7 @@ def compute_conditional_nig(
         spans=spans,
         layer_idx=layer_idx,
         neuron_idx=neuron_idx,
+        neuron_type=neuron_type,
         aggregate_per_token_type=aggregate_per_token_type,
         source_input_part=source_input_part,
         target_input_part=target_input_part,
@@ -388,7 +412,7 @@ if __name__ == "__main__":
         max_input_length=max_input_length, 
         layer_idx=2, 
         neuron_idx=5, 
-        neuron_type=NeuronType.ATTENTION,
-        source_input_part=InputPart.QUERY,
-        target_input_part=None
+        neuron_type=NeuronType.FFN,
+        source_input_part=None,
+        target_input_part=InputPart.QUERY
     )
