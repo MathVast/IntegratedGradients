@@ -1,5 +1,6 @@
 import gc
 from enum import Enum
+import itertools
 from typing import Optional
 from pyparsing import Dict
 import torch
@@ -7,7 +8,6 @@ import torch.nn.functional as F
 from transformers import AutoModelForSequenceClassification, AutoTokenizer 
 from tqdm import tqdm      
 
-from neuron_integrated_gradients import aggregate_nig
 from utils import InputPart, OutputsExtractor, _get_ig_error, _get_scaled_inputs, generate_baseline_with_padded_query_but_special_tokens, get_interesting_modules, get_token_types_spans, INPUT_PART_TO_POSITION
 
 class NeuronType(Enum):
@@ -28,7 +28,87 @@ class NeuronType(Enum):
             return f"bert.encoder.layer.{layer_idx}.attention.self.dropout"
         else:
             return f"bert.encoder.layer.{layer_idx}.intermediate.dense"
+        
+def get_layer_idx_from_module_name(module_name: str) -> int:
+    """
+    Extract the layer index from a module name string.
+    Assumes the module name follows the format 'bert.encoder.layer.{layer_idx}...'.
+    """
+    parts = module_name.split('.')
+    try:
+        layer_idx_position = parts.index('layer') + 1
+        layer_idx = int(parts[layer_idx_position])
+        return layer_idx
+    except (ValueError, IndexError):
+        raise ValueError(f"Invalid module name format: {module_name}")
 
+def aggregate_conditional_nig(nig, spans, layer_idx: int, neuron_idx: int, aggregate_per_token_type=False, source_input_part: Optional[InputPart] = None, target_input_part: Optional[InputPart] = None):
+    """
+    Aggregate the neuron integrated gradients (NIG) across token types if specified.
+    For conditional NIG, this function also acts as a selector of the active slices and if filters out all the other
+    by setting them to NaN.
+    """
+    storage = dict()
+    
+    for key, value in nig.items():
+        if aggregate_per_token_type:
+            storage[key] = dict()
+            if "attention_probs" in key:
+                layer_idx_in_key = get_layer_idx_from_module_name(key)
+                if layer_idx_in_key == layer_idx:
+                    # If target layer of the conditonal NIG, we apply the filtering
+                    if source_input_part is not None and target_input_part is not None:
+                        # If both inpupt parts are specified, we only keep the corresponding slice
+                        target_input_part_str = str(target_input_part)
+                        source_input_part_str = str(source_input_part)
+                        storage[key][f"{target_input_part_str}_{source_input_part_str}"] = torch.sum(value[:,spans[INPUT_PART_TO_POSITION[target_input_part_str]],spans[INPUT_PART_TO_POSITION[source_input_part_str]]], axis=(1,2), keepdim=True)
+
+                    elif source_input_part is not None and target_input_part is None:
+                        source_input_part_str = str(source_input_part)
+                        # If only one input part is specified, we keep all slices involving this input part
+                        for targets in INPUT_PART_TO_POSITION.keys():
+                            storage[key][f"{targets}_{source_input_part_str}"] = torch.sum(value[:,spans[INPUT_PART_TO_POSITION[targets]],spans[INPUT_PART_TO_POSITION[source_input_part_str]]], axis=(1,2), keepdim=True)
+
+                    elif source_input_part is None and target_input_part is not None:
+                        target_input_part_str = str(target_input_part)
+                        for sources in INPUT_PART_TO_POSITION.keys():
+                            storage[key][f"{target_input_part_str}_{sources}"] = torch.sum(value[:,spans[INPUT_PART_TO_POSITION[target_input_part_str]],spans[INPUT_PART_TO_POSITION[sources]]], axis=(1,2), keepdim=True)
+                    else:
+                        # If no input part is specified, we keep everything
+                        for couple in itertools.product(INPUT_PART_TO_POSITION.keys(), repeat=2):
+                            # itertools.product is equivalent to a nest for loop and creates every possible combinations of the input_parts (total nb is 25).
+                            # For each couple of input parts, we select the corresponding slices in the last two dimensions and sum over these dimensions.
+                            # To mitigate the impact of the input length, we then average it by the product of the lengths of the two slices.
+                            storage[key][f"{couple[0]}_{couple[1]}"] = torch.sum(value[:,spans[INPUT_PART_TO_POSITION[couple[0]]],spans[INPUT_PART_TO_POSITION[couple[1]]]], axis=(1,2), keepdim=True)
+
+                    if neuron_idx is not None:
+                        # Set to NaN all other positions except the one corresponding to the neuron_idx
+                        for k in storage[key].keys():
+                            temp = storage[key][k]
+                            mask = torch.ones_like(temp, dtype=bool)
+                            mask[neuron_idx,:,:] = False
+                            temp = temp.masked_fill(mask, float('nan'))
+                            storage[key][k] = temp
+                else:
+                    # If not the target layer of the conditonal NIG, we proceed as usual 
+                    for couple in itertools.product(INPUT_PART_TO_POSITION.keys(), repeat=2):
+                        # itertools.product is equivalent to a nest for loop and creates every possible combinations of the input_parts (total nb is 25).
+                        # For each couple of input parts, we select the corresponding slices in the last two dimensions and sum over these dimensions.
+                        # To mitigate the impact of the input length, we then average it by the product of the lengths of the two slices.
+                        storage[key][f"{couple[0]}_{couple[1]}"] = torch.sum(value[:,spans[INPUT_PART_TO_POSITION[couple[0]]],spans[INPUT_PART_TO_POSITION[couple[1]]]], axis=(1,2), keepdim=True)
+                        
+            else:
+                for input_part, idx in INPUT_PART_TO_POSITION.items():
+                    storage[key][input_part] = torch.sum(value[spans[idx],:], axis=0)
+        else:
+            if "attention_probs" in key:
+                storage[key] = {'all': torch.sum(value, axis=(1,2))}
+            else:
+                storage[key] = {'all': torch.sum(value, axis=0)}
+
+    print(f"Results have been aggregated.")
+
+    return storage
 
 def conditional_nig(
     model, 
@@ -41,6 +121,7 @@ def conditional_nig(
     layer_idx: int, 
     neuron_idx: int, 
     neuron_type: NeuronType, 
+    source_input_part: Optional[InputPart] = None,
     target_input_part: Optional[InputPart] = None,
     spans: Optional[torch.Tensor] = None,
     compute_error: bool = False,
@@ -64,10 +145,6 @@ def conditional_nig(
     :param bool compute_error: Whether to compute the IG approximation error or not.
     :return Dict: Attribution for each activation unit for each layer in the model.
     """
-    if spans is None and target_input_part is not None:
-        raise ValueError("If target_input_part is specified, spans must also be provided.")
-    if spans is not None and target_input_part is None:
-        raise ValueError("If spans are provided, target_input_part must also be specified.")
 
     layer_names, _ = get_interesting_modules(
         model=model,
@@ -110,11 +187,17 @@ def conditional_nig(
         if neuron_type == NeuronType.ATTENTION:
             # For attention, we have a 4D tensor: (batch_size, num_heads, seq_len, seq_len)
             target_neuron_activation = target_activation[:, neuron_idx, :, :] # Shape (batch_size, seq_len, seq_len)
-            if not target_input_part:
+            if not target_input_part and not source_input_part:
                 # Aggregate over all attention positions
-                target_neuron_activation = target_neuron_activation.sum(dim=(1,2))  # Shape (batch_size)
-            else:        
-                target_neuron_activation = torch.sum(target_neuron_activation[:,spans[INPUT_PART_TO_POSITION[str(target_input_part)]],spans[INPUT_PART_TO_POSITION[str(target_input_part)]]], axis=(1,2), keepdim=True)                
+                target_spans = (slice(None), slice(None))
+            elif not target_input_part:
+                target_spans = (slice(None), spans[INPUT_PART_TO_POSITION[str(source_input_part)]])
+            elif not source_input_part:
+                target_spans = (spans[INPUT_PART_TO_POSITION[str(target_input_part)]], slice(None))
+            else:
+                target_spans = (spans[INPUT_PART_TO_POSITION[str(target_input_part)]], spans[INPUT_PART_TO_POSITION[str(source_input_part)]])
+
+            target_neuron_activation = torch.sum(target_neuron_activation[:,target_spans[0], target_spans[1]], axis=(1,2), keepdim=True)                
         else:
             # For FFN, we have a 3D tensor: (batch_size, seq_len, hidden_size)
             target_neuron_activation = target_activation[:, :, neuron_idx] 
@@ -174,6 +257,7 @@ def compute_conditional_nig(
         layer_idx: int, 
         neuron_idx: int, 
         neuron_type: NeuronType, 
+        source_input_part: Optional[InputPart] = None,
         target_input_part: Optional[InputPart] = None,
         aggregate_per_token_type=False, 
         max_input_length=128
@@ -240,14 +324,19 @@ def compute_conditional_nig(
         layer_idx=layer_idx,
         neuron_idx=neuron_idx,
         neuron_type=neuron_type,
+        source_input_part=source_input_part,
         target_input_part=target_input_part,
-        spans=spans if target_input_part is not None else None,
+        spans=spans
     )
 
-    nig = aggregate_nig(
+    nig = aggregate_conditional_nig(
         nig,
         spans=spans,
+        layer_idx=layer_idx,
+        neuron_idx=neuron_idx,
         aggregate_per_token_type=aggregate_per_token_type,
+        source_input_part=source_input_part,
+        target_input_part=target_input_part,
     )
 
     return nig, error
@@ -297,8 +386,9 @@ if __name__ == "__main__":
         10, 
         aggregate_per_token_type=True, 
         max_input_length=max_input_length, 
-        layer_idx=5, 
-        neuron_idx=1200, 
-        neuron_type=NeuronType.FFN,
-        target_input_part=InputPart.DOCUMENT
+        layer_idx=2, 
+        neuron_idx=5, 
+        neuron_type=NeuronType.ATTENTION,
+        source_input_part=InputPart.QUERY,
+        target_input_part=None
     )
